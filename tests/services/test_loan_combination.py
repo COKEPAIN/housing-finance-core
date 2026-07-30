@@ -24,13 +24,19 @@ from app.regulations.mortgage_limits import (
     RegulationZone,
     ResolvedPolicyLimit,
 )
+from app.rule_engine.product_packs.handoff import ProductCandidate
 from app.rule_engine.product_packs.models import EvaluationStatus
 from app.services.loan_combination import (
     build_combination_budget,
     build_combination_legs,
     combine_loan_options,
+    probe_amount_limited_products,
 )
-from app.services.loan_simulation import LoanSimulationRequest, LoanSimulationResult
+from app.services.loan_simulation import (
+    LoanSimulationRequest,
+    LoanSimulationResult,
+    simulate_loan_options,
+)
 from app.services.recommendation import LoanRecommendationSupplement
 
 _AS_OF = date(2026, 7, 30)
@@ -272,6 +278,148 @@ class TestCreditStressThresholdWiring:
         assert budget is not None
         assert budget.existing_credit_loan_balance is None
         assert budget.credit_headroom_below_threshold is None
+
+
+def _candidate(name: str, rate: str = "4.86") -> ProductCandidate:
+    """실제 Rule Pack이 붙는 상품 후보. 옵션은 금리 한 줄이면 충분하다."""
+    return ProductCandidate(
+        product_name=name,
+        base_data={"fin_prdt_nm": name},
+        option_list=(
+            {
+                "fin_prdt_nm": name,
+                "mrtg_type_nm": "무보증",
+                "rpay_type_nm": "분할상환",
+                "lend_rate_type_nm": "변동금리",
+                "lend_rate_min": rate,
+                "lend_rate_max": rate,
+                "lend_rate_avg": rate,
+            },
+        ),
+    )
+
+
+_CREDIT_FACTS: dict[str, object] = {
+    "age": 36,
+    "annual_income": Decimal("70000000"),
+    "combined_annual_income": Decimal("70000000"),
+    "is_first_home_buyer": True,
+    "owns_house": False,
+    "owned_house_count": 0,
+    "loan_term_years": 30,
+    "employment_months": 60,
+    "credit_score": 900,
+    "is_foreigner": False,
+    "is_household_head": True,
+    "salary_transfer_count": 6,
+    "is_sole_proprietor": False,
+    "is_pension_transfer_recipient": False,
+    "financial_cost_burden_ratio": Decimal("0.25"),
+    "requested_amount": Decimal("350000000"),
+}
+
+
+class TestAmountLimitedProductsAreReProbed:
+    """전액 요청으로 탈락한 상품을 사유 해석이 아니라 **재판정**으로 되살린다.
+
+    Rule Pack은 `requested_amount`(필요금액 전액)로 판정하므로 신용대출이
+    "대출금액이 한도를 초과합니다"로 탈락한다. 조합의 전제는 그 상품이 일부만
+    담당한다는 것이라, 이 탈락은 조합에서 성립하지 않는다.
+    """
+
+    def test_a_product_rejected_only_on_amount_comes_back(self) -> None:
+        request = _request(user_facts=_CREDIT_FACTS)
+        candidate = _candidate("KB 급여이체신용대출")
+
+        # 전액 3.5억으로는 자격에서 탈락한다.
+        full = simulate_loan_options(request, [candidate])
+        assert not full.executable
+        assert full.rejected
+
+        found, notes = probe_amount_limited_products(request, [candidate])
+
+        assert found, "상품 한도 금액으로 다시 물으면 통과해야 한다"
+        assert all(item.amount <= Decimal("150000000") for item in found)
+        assert any("다시 판정하니 통과" in note for note in notes)
+
+    def test_the_reason_string_is_never_parsed(self) -> None:
+        """되살리는 근거는 재판정 결과이지 사유 문자열이 아니다.
+
+        문자열을 읽어 "금액 때문"이라고 판단하면 자유텍스트 임의 판정이 된다
+        (부록 B-3이 금지하는 그것). 그래서 진짜 자격 미달은 재판정에서도
+        탈락하고 되살아나지 않는다.
+        """
+        # 개인사업자는 이 상품을 신청할 수 없다(KB_SALARY_CREDIT_EXCLUDED_APPLICANT).
+        # 금액과 무관한 조건이므로 금액을 줄여도 답이 바뀌지 않는다.
+        request = _request(user_facts={**_CREDIT_FACTS, "is_sole_proprietor": True})
+
+        found, _ = probe_amount_limited_products(
+            request, [_candidate("KB 급여이체신용대출")]
+        )
+
+        assert found == (), "금액과 무관한 자격 미달은 되살아나면 안 된다"
+
+    def test_an_already_executable_product_is_not_re_probed(self) -> None:
+        request = _request(user_facts=_CREDIT_FACTS)
+        candidate = _candidate("KB 급여이체신용대출")
+
+        found, _ = probe_amount_limited_products(
+            request,
+            [candidate],
+            already_executable=["KB 급여이체신용대출"],
+        )
+
+        assert found == ()
+
+    def test_a_product_outside_the_reviewed_limit_table_is_left_alone(self) -> None:
+        """검수되지 않은 상품에 임의 한도를 부여하지 않는다."""
+        request = _request(user_facts=_CREDIT_FACTS)
+
+        found, notes = probe_amount_limited_products(
+            request, [_candidate("검수표에 없는 대출")]
+        )
+
+        assert found == ()
+        assert notes == ()
+
+    def test_a_limit_above_the_required_amount_is_not_re_probed(self) -> None:
+        """상품 한도가 필요금액 이상이면 금액이 병목이 아니었다."""
+        request = _request(
+            user_facts={**_CREDIT_FACTS, "requested_amount": Decimal("2000000")},
+            required_amount=Decimal("2000000"),
+        )
+
+        found, _ = probe_amount_limited_products(
+            request, [_candidate("KB 급여이체신용대출")]
+        )
+
+        assert found == ()
+
+    def test_probing_is_off_unless_candidates_are_supplied(self) -> None:
+        """후보를 주지 않으면 재판정하지 않는다 — 기존 호출자의 동작이 안 바뀐다."""
+        request = _request(user_facts=_CREDIT_FACTS)
+
+        without = combine_loan_options(request, _result(_computation()))
+        with_probe = combine_loan_options(
+            request,
+            _result(_computation()),
+            candidates=[_candidate("KB 급여이체신용대출")],
+        )
+
+        assert all(plan.leg_count == 1 for plan in without.plans)
+        assert any(plan.leg_count == 2 for plan in with_probe.plans)
+
+    def test_the_revival_is_recorded_in_the_result(self) -> None:
+        """되살린 사실을 조용히 넘기지 않는다 — 근거가 결과에 남아야 한다."""
+        request = _request(user_facts=_CREDIT_FACTS)
+
+        result = combine_loan_options(
+            request,
+            _result(_computation()),
+            candidates=[_candidate("KB 급여이체신용대출")],
+        )
+
+        assert any("다시 판정하니 통과" in reason for reason in result.reasons)
 
 
 class TestTheGateIsWired:

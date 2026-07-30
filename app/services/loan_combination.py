@@ -22,12 +22,15 @@
 """
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from decimal import Decimal
 
+from app.data_pipeline.adapters.loan_engine_adapter import LoanComputation
 from app.data_pipeline.curated.loan_combinations import (
     collateral_group,
     resolve_combination,
 )
+from app.data_pipeline.curated.loan_limits import LimitKind, resolve_product_limit
 from app.engines.loan.combination import build_loan_combinations
 from app.engines.loan.combination_models import (
     DEFAULT_COMBINATION_POLICY,
@@ -46,7 +49,13 @@ from app.regulations.stress_dsr import (
     resolve_stress_region,
     stressed_annual_rate,
 )
-from app.services.loan_simulation import LoanSimulationRequest, LoanSimulationResult
+from app.rule_engine.product_packs.handoff import ProductCandidate
+from app.rule_engine.product_packs.registry import ProductRulePackRegistry
+from app.services.loan_simulation import (
+    LoanSimulationRequest,
+    LoanSimulationResult,
+    simulate_loan_options,
+)
 from app.services.recommendation import LoanRecommendationSupplement
 
 _KIND_BY_GROUP = {
@@ -104,11 +113,78 @@ def _above_threshold_credit_rate(
     return above
 
 
+def probe_amount_limited_products(
+    request: LoanSimulationRequest,
+    candidates: Sequence[ProductCandidate],
+    *,
+    already_executable: Sequence[str] = (),
+    registry: ProductRulePackRegistry | None = None,
+) -> tuple[tuple[LoanComputation, ...], tuple[str, ...]]:
+    """전액 요청으로 탈락한 상품을 **자기 한도만큼의 금액**으로 다시 물어본다.
+
+    왜 필요한가:
+        Rule Pack은 `requested_amount`(= 필요 대출금액 전액)로 자격을 판정한다.
+        그래서 신용대출이 "대출금액이 한도(1.5억)를 초과합니다"로 탈락한다. 그런데
+        **조합의 전제는 그 상품이 일부만 담당한다는 것**이다. 5천만원이면 한도
+        안이므로 이 탈락은 조합에서는 성립하지 않는다.
+
+    왜 사유를 해석하지 않는가:
+        탈락 사유 문자열을 읽어 "금액 때문"이라고 판단하면 자유텍스트 임의 판정이
+        된다(부록 B-3이 금지하는 그것이다). 대신 **줄인 금액으로 같은 Rule Pack에
+        다시 물어본다.** 통과하면 금액 때문이었다는 것이 증명되고, 여전히 탈락하면
+        진짜 자격 미달이다. 추측이 아니라 재판정이다.
+
+    상한을 어디서 얻는가:
+        검수된 상품 한도표(`curated/loan_limits.py`)다. 한도를 확인하지 못한 상품
+        (`UNKNOWN`)이나 상품 고유 상한이 없는 상품(`UNCAPPED`)은 건드리지 않는다.
+        전자는 근거가 없고, 후자는 애초에 금액 때문에 탈락한 것이 아니다.
+
+    범위형 조건 가정:
+        상한에서 통과하고 상품 최소금액에서도 실행 가능하면, 그 사이 금액도
+        가능하다고 본다. 실제 조항이 "최소 X ~ 최대 Y" 형태라 성립한다. 조합
+        엔진이 `minimum_amount`를 따로 지키므로 아래쪽 끝도 보호된다.
+    """
+    executable_names = set(already_executable)
+    found: list[LoanComputation] = []
+    notes: list[str] = []
+
+    for candidate in candidates:
+        name = candidate.product_name
+        if name in executable_names:
+            continue
+        limit = resolve_product_limit(name, request.user_facts)
+        if limit.kind is not LimitKind.AMOUNT or limit.amount is None:
+            continue
+        cap = min(limit.amount, request.required_amount)
+        if cap >= request.required_amount:
+            # 상품 한도가 필요금액 이상이면 금액이 병목이 아니었다. 다시 물어도
+            # 같은 답이 나오므로 호출하지 않는다.
+            continue
+
+        probe_facts = dict(request.user_facts)
+        probe_facts["requested_amount"] = cap
+        probe = replace(request, required_amount=cap, user_facts=probe_facts)
+        probed = simulate_loan_options(probe, [candidate], registry=registry)
+        if not probed.executable:
+            continue
+
+        for computation in probed.executable:
+            found.append(computation)
+        notes.append(
+            f"{name}: 필요 대출금액 전액으로는 자격에서 탈락했으나 "
+            f"상품 한도 {cap:,.0f}원으로 다시 판정하니 통과했습니다. "
+            "조합에서 그 금액까지만 담당하는 다리로 넣었습니다."
+        )
+
+    return tuple(found), tuple(notes)
+
+
 def build_combination_legs(
     request: LoanSimulationRequest,
     result: LoanSimulationResult,
     *,
     supplements: Mapping[str, LoanRecommendationSupplement] | None = None,
+    extra_computations: Sequence[LoanComputation] = (),
 ) -> tuple[tuple[LoanLegCandidate, ...], tuple[str, ...]]:
     """실행 가능한 옵션을 조합 다리 후보로 바꾼다.
 
@@ -119,7 +195,9 @@ def build_combination_legs(
     skipped: list[str] = []
     lookup = supplements or {}
 
-    for index, computation in enumerate(result.executable, start=1):
+    for index, computation in enumerate(
+        (*result.executable, *extra_computations), start=1
+    ):
         name = computation.product_name
         group = collateral_group(name)
         if group is None:
@@ -224,11 +302,17 @@ def combine_loan_options(
     *,
     supplements: Mapping[str, LoanRecommendationSupplement] | None = None,
     policy: LoanCombinationPolicy = DEFAULT_COMBINATION_POLICY,
+    candidates: Sequence[ProductCandidate] = (),
+    registry: ProductRulePackRegistry | None = None,
 ) -> LoanCombinationResult:
     """계산 결과에서 조합안 상위 N개를 만든다.
 
     중복 이용 검수표를 게이트로 넘긴다 — 이것이 없으면 조합 엔진은 다리 2개 이상인
     조합을 아예 만들지 않는다.
+
+    ``candidates``를 주면 전액 요청으로 탈락한 상품을 자기 한도만큼의 금액으로
+    다시 판정한다(`probe_amount_limited_products`). 주지 않으면 그 재판정을 하지
+    않으므로, 신용대출처럼 한도가 작은 상품이 조합에서 빠진다.
     """
     budget = build_combination_budget(request, result)
     if budget is None:
@@ -241,7 +325,23 @@ def combine_loan_options(
             ),
         )
 
-    legs, skipped = build_combination_legs(request, result, supplements=supplements)
+    extra, probe_notes = (
+        probe_amount_limited_products(
+            request,
+            candidates,
+            already_executable=[item.product_name for item in result.executable],
+            registry=registry,
+        )
+        if candidates
+        else ((), ())
+    )
+    legs, skipped = build_combination_legs(
+        request,
+        result,
+        supplements=supplements,
+        extra_computations=extra,
+    )
+    skipped = (*probe_notes, *skipped)
     if not legs:
         return LoanCombinationResult(
             status=CombinationStatus.UNRESOLVED,
