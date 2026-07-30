@@ -25,6 +25,7 @@ from app.api.routes.simulations import (
 from app.reports.ai_explanation.pipeline import build_final_report
 from app.reports.context import build_report_ai_input
 from app.reports.templates.html import collect_product_terms, render_report_html
+from app.reports.templates.official import render_official_report
 from app.rule_engine.product_packs.handoff import ProductCandidate
 from app.rule_engine.product_packs.registry import ProductRulePackRegistry
 from app.schemas.simulation import SimulationInput, SimulationResult
@@ -71,7 +72,9 @@ def create_report(
     registry: Annotated[ProductRulePackRegistry | None, Depends(get_loan_rule_registry)],
     calculated_at: Annotated[datetime, Depends(get_calculated_at)],
     simulation_id: Annotated[UUID, Depends(get_simulation_id)],
-    response_format: Annotated[Literal["json", "html"], Query(alias="format")] = "json",
+    response_format: Annotated[
+        Literal["json", "html", "print"], Query(alias="format")
+    ] = "json",
 ) -> ReportResponse | HTMLResponse:
     """계산하고, 두 에이전트를 돌리고, 통과한 것만 조합해 보고서를 돌려준다."""
     simulation = run_simulation(
@@ -84,6 +87,11 @@ def create_report(
     )
     report_input = build_report_ai_input(simulation)
     report = build_final_report(report_input)
+
+    if response_format == "print":
+        # 인쇄용 정식 보고서. 우대조건 원문은 넘기지 않는다 — 자유텍스트 자격조건을
+        # 문서에 확정 사실처럼 싣지 않는다는 규약(부록 B-3)과 같은 이유다.
+        return HTMLResponse(render_official_report(report, simulation))
 
     if response_format == "html":
         # 우대조건 원문은 화면 표시 전용이다. 계산에도 AI 전송에도 쓰지 않으므로
