@@ -21,6 +21,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from app.engines.cashflow.models import CashflowResult
+from app.engines.loan.combination_models import LoanCombinationResult
 from app.engines.recommendation.models import CombinedRecommendationResult
 from app.engines.savings.portfolio_models import SavingsPortfolioResult
 from app.engines.strategy.models import StrategyComparisonResult
@@ -194,6 +195,7 @@ def build_simulation_result(
     cashflow_result: CashflowResult | Mapping[str, object] | None = None,
     savings_portfolio_result: SavingsPortfolioResult | None = None,
     loan_simulation_result: LoanSimulationResult | None = None,
+    loan_combination_result: LoanCombinationResult | None = None,
     recommendation_result: CombinedRecommendationResult | None = None,
     stress_test_result: StressTestResult | None = None,
     strategy_comparison_result: StrategyComparisonResult | None = None,
@@ -226,6 +228,10 @@ def build_simulation_result(
             loan_simulation_result,
             section_schema_version="loan-simulation@1.0.0",
         ),
+        "loan_combination": build_calculation_section(
+            loan_combination_result,
+            section_schema_version="loan-combination@1.0.0",
+        ),
         "recommendation": build_calculation_section(
             recommendation_result,
             section_schema_version="combined-recommendation@1.0.0",
@@ -252,6 +258,7 @@ def build_simulation_result(
         cashflow=sections["cashflow"],
         savings_portfolio=sections["savings_portfolio"],
         loan_simulation=sections["loan_simulation"],
+        loan_combination=sections["loan_combination"],
         recommendation=sections["recommendation"],
         stress_test=sections["stress_test"],
         strategy_comparison=sections["strategy_comparison"],

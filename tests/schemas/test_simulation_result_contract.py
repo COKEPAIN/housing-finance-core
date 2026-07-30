@@ -6,6 +6,14 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from app.engines.loan.combination_models import (
+    CombinationStatus,
+    CreditStressRegime,
+    LoanCombinationPlan,
+    LoanCombinationResult,
+    LoanLegAllocation,
+    LoanLegKind,
+)
 from app.engines.recommendation import (
     CombinedRecommendationInput,
     DecisionStatus,
@@ -307,6 +315,85 @@ def test_not_run_is_distinct_from_completed_empty_result() -> None:
     assert result.cashflow.run_status is SectionRunStatus.NOT_RUN
     assert result.cashflow.result is None
     assert result.loan_simulation.run_status is SectionRunStatus.NOT_RUN
+    assert result.loan_combination.run_status is SectionRunStatus.NOT_RUN
+    assert result.loan_combination.result is None
+
+
+def test_the_combination_section_is_versioned_separately() -> None:
+    """조합 절 추가는 하위 호환이라 최상위 `schema_version`을 올리지 않는다.
+
+    소비자는 구간 버전(`section_schema_version`)으로 변경을 감지한다
+    (`app/schemas/README.md` 「변경 원칙」).
+    """
+    result = build_simulation_result(
+        _input(),
+        simulation_id=_SIMULATION_ID,
+        as_of=_AS_OF,
+        calculated_at=_CALCULATED_AT,
+    )
+
+    assert result.schema_version == "1.0.0"
+    assert result.loan_combination.section_schema_version == "loan-combination@1.0.0"
+
+
+def test_the_combination_section_carries_plans_without_precision_loss() -> None:
+    """조합 금액도 Decimal 문자열로 실린다 — float로 바꾸면 원 단위가 흔들린다."""
+    combination = LoanCombinationResult(
+        status=CombinationStatus.PARTIAL,
+        plans=(
+            LoanCombinationPlan(
+                plan_id="leg-a|leg-b|BELOW|assessment_cost",
+                legs=(
+                    LoanLegAllocation(
+                        candidate_id="leg-a",
+                        product_id="KB 주택담보대출",
+                        product_name="KB 주택담보대출",
+                        option_name="고정·원리금균등",
+                        kind=LoanLegKind.MORTGAGE,
+                        amount=Decimal("242671379"),
+                        monthly_payment=Decimal("1109000"),
+                        assessment_monthly_payment=Decimal("1560000"),
+                        total_interest=Decimal("156569621"),
+                        annual_rate=Decimal("0.0365"),
+                        assessment_annual_rate=Decimal("0.0665"),
+                        months=360,
+                    ),
+                ),
+                total_amount=Decimal("242671379"),
+                funding_shortfall=Decimal("17328621"),
+                covers_required_amount=False,
+                monthly_payment=Decimal("1109000"),
+                assessment_monthly_payment=Decimal("1560000"),
+                expected_dsr=Decimal("0.3232"),
+                assessment_dsr=Decimal("0.4000"),
+                post_purchase_monthly_surplus=Decimal("890000"),
+                stress_monthly_surplus=Decimal("440000"),
+                total_interest=Decimal("156569621"),
+                total_financial_cost=None,
+                credit_regime=CreditStressRegime.BELOW,
+            ),
+        ),
+    )
+
+    result = build_simulation_result(
+        _input(),
+        simulation_id=_SIMULATION_ID,
+        as_of=_AS_OF,
+        calculated_at=_CALCULATED_AT,
+        loan_combination_result=combination,
+    )
+    payload = json.loads(result.model_dump_json())
+    section = payload["loan_combination"]
+
+    assert section["run_status"] == "COMPLETED"
+    assert section["result"]["status"] == "PARTIAL"
+    plan = section["result"]["plans"][0]
+    assert plan["total_amount"] == "242671379"
+    assert plan["funding_shortfall"] == "17328621"
+    assert plan["legs"][0]["amount"] == "242671379"
+    assert plan["credit_regime"] == "BELOW"
+    # 총비용을 확인하지 못한 상태가 0원으로 바뀌지 않는다.
+    assert plan["total_financial_cost"] is None
 
 
 def test_calculated_at_requires_a_timezone() -> None:

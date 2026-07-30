@@ -250,6 +250,13 @@ class SimulationResult(BaseModel):
     cashflow: CalculationSection
     savings_portfolio: CalculationSection
     loan_simulation: CalculationSection
+    # 여러 대출을 동시에 실행하는 조합안. `loan_simulation`이 옵션 **하나**의
+    # 한도라면 이쪽은 그것들을 공유 예산(DSR·현금흐름·LTV) 안에서 묶은 결과다.
+    # 두 절의 금액을 더하면 안 된다 — 조합 절이 이미 합계를 담고 있다.
+    #
+    # 하위 호환 추가라 최상위 `schema_version`은 올리지 않는다(README 「변경
+    # 원칙」). 이 구간을 소비하는 쪽은 `section_schema_version`을 본다.
+    loan_combination: CalculationSection
     recommendation: CalculationSection
     stress_test: CalculationSection
     strategy_comparison: CalculationSection

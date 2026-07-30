@@ -36,6 +36,7 @@ from app.rule_engine.product_packs.handoff import ProductCandidate
 from app.rule_engine.product_packs.registry import ProductRulePackRegistry
 from app.schemas.simulation import GoalType, LoanRequestInput, SimulationInput, SimulationResult
 from app.services.cashflow_diagnosis import diagnose_cashflow
+from app.services.loan_combination import combine_loan_options
 from app.services.loan_simulation import (
     LoanSimulationRequest,
     LoanSimulationResult,
@@ -284,6 +285,19 @@ def run_simulation(
             registry=registry,
         )
 
+    # 조합안은 옵션별 한도가 나온 뒤에야 만들 수 있다. 후보를 함께 넘겨야
+    # 전액 요청으로 탈락한 상품(신용대출 등)을 자기 한도만큼의 금액으로 다시
+    # 판정한다 — 그러지 않으면 한도가 작은 상품이 조합에서 통째로 빠진다.
+    combination = None
+    if loan_request is not None and loan_result is not None:
+        combination = combine_loan_options(
+            loan_request,
+            loan_result,
+            supplements=loan_supplements,
+            candidates=loan_candidates,
+            registry=registry,
+        )
+
     recommendation = None
     stress = None
     strategy = None
@@ -322,6 +336,7 @@ def run_simulation(
         calculated_at=calculated_at,
         cashflow_result=cashflow_result,
         loan_simulation_result=loan_result,
+        loan_combination_result=combination,
         recommendation_result=recommendation,
         stress_test_result=stress,
         savings_portfolio_result=savings_portfolio_result,
