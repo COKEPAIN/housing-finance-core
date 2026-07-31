@@ -165,6 +165,27 @@ class LoanRequestInput(BaseModel):
     # 없으면 계산 기준일(``as_of``)을 쓴다.
     regulation_as_of: date | None = None
     for_house_purchase: bool = True
+    # 상품명 → 고객이 실제로 부담하는 부대비용 총액(보증료·인지세·채권매입 손실 등).
+    #
+    # 왜 사용자 입력인가: 원천 데이터의 부대비용 원문에 국민주택채권 매입·할인
+    # 비용이 들어 있는데, 할인율이 채권 시세로 매일 변해 우리가 확정할 수 없다.
+    # 검수표로 닫히지 않는 종류의 값이며, 은행이 실행 직전에 안내한다.
+    #
+    # 넣지 않으면 §14.2 총비용 점수가 산출되지 않고 부록 A-10이 가중치를
+    # 재정규화한다. **일부 상품만 넣어도 마찬가지다** — 항목이 상품마다 다르게
+    # 빠지면 비용을 빠뜨린 상품이 유리해져 순위가 뒤집힌다.
+    #
+    # 은행 부담 항목은 넣지 않는다. 여기 값은 차주가 내는 금액이다.
+    loan_incidental_costs: dict[str, Decimal] | None = None
+
+    @model_validator(mode="after")
+    def validate_incidental_costs(self) -> "LoanRequestInput":
+        for name, amount in (self.loan_incidental_costs or {}).items():
+            if not name.strip():
+                raise ValueError("부대비용 항목의 상품명은 비어 있을 수 없습니다.")
+            if amount < 0:
+                raise ValueError(f"{name}의 부대비용은 음수일 수 없습니다.")
+        return self
 
 
 class SimulationInput(BaseModel):

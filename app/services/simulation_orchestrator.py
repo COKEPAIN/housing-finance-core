@@ -238,6 +238,38 @@ def build_loan_request(
     return built, (), reasons, amount_assumptions + borrower_assumptions
 
 
+def _merge_incidental_costs(
+    payload: SimulationInput,
+    supplements: Mapping[str, LoanRecommendationSupplement] | None,
+) -> Mapping[str, LoanRecommendationSupplement] | None:
+    """사용자가 넣은 상품별 부대비용을 추천 보조자료에 합친다.
+
+    부대비용은 국민주택채권 할인비용처럼 **실행 시점 시세**에 달린 항목을 포함해
+    검수표로 확정할 수 없다. 은행이 실행 직전에 안내하므로 사용자가 그 값을 넣을
+    수 있게 하고, 넣지 않으면 총비용 점수를 산출하지 않는다.
+
+    호출자가 이미 준 보조자료가 우선이다. 확인된 값을 사용자 입력이 덮으면 근거가
+    뒤바뀐다.
+    """
+    request = payload.loan_request
+    costs = request.loan_incidental_costs if request is not None else None
+    if not costs:
+        return supplements
+
+    merged = dict(supplements or {})
+    for name, amount in costs.items():
+        existing = merged.get(name)
+        if existing is not None and existing.additional_financial_cost is not None:
+            continue
+        merged[name] = LoanRecommendationSupplement(
+            additional_financial_cost=amount,
+            repayment_flexibility_score=(
+                None if existing is None else existing.repayment_flexibility_score
+            ),
+        )
+    return merged
+
+
 def run_simulation(
     payload: SimulationInput,
     *,
@@ -288,12 +320,16 @@ def run_simulation(
     # 조합안은 옵션별 한도가 나온 뒤에야 만들 수 있다. 후보를 함께 넘겨야
     # 전액 요청으로 탈락한 상품(신용대출 등)을 자기 한도만큼의 금액으로 다시
     # 판정한다 — 그러지 않으면 한도가 작은 상품이 조합에서 통째로 빠진다.
+    # 사용자가 은행에서 안내받은 부대비용을 넣었으면 보조자료에 합친다. 호출자가
+    # 명시한 `loan_supplements`가 우선이다 — 이미 확인된 값을 입력이 덮으면 안 된다.
+    supplements = _merge_incidental_costs(payload, loan_supplements)
+
     combination = None
     if loan_request is not None and loan_result is not None:
         combination = combine_loan_options(
             loan_request,
             loan_result,
-            supplements=loan_supplements,
+            supplements=supplements,
             candidates=loan_candidates,
             registry=registry,
         )
@@ -308,7 +344,7 @@ def run_simulation(
             loan_result=loan_result,
             savings_result=savings_portfolio_result,
             savings_validation=savings_validation,
-            loan_supplements=loan_supplements,
+            loan_supplements=supplements,
         )
 
     if recommendation is not None and loan_request is not None:
