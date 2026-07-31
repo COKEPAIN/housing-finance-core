@@ -31,6 +31,7 @@ from app.data_pipeline.curated.loan_combinations import (
     resolve_combination,
 )
 from app.data_pipeline.curated.loan_limits import LimitKind, resolve_product_limit
+from app.data_pipeline.curated.loan_prepayment_terms import resolve_prepayment_terms
 from app.engines.loan.combination import build_loan_combinations
 from app.engines.loan.combination_models import (
     DEFAULT_COMBINATION_POLICY,
@@ -179,6 +180,46 @@ def probe_amount_limited_products(
     return tuple(found), tuple(notes)
 
 
+def _flexibility_scores(
+    request: LoanSimulationRequest,
+    product_names: Sequence[str],
+) -> dict[str, Decimal]:
+    """§14.5 상환유연성 점수를 후보 집합 안에서 상대 정규화한다.
+
+    부록 A-1의 `norm_inv(x; a=후보 최소, b=후보 최대)`를 쓴다 — 총금융비용점수가
+    쓰는 것과 같은 방식이며, 그래서 **새 상수가 생기지 않는다.** 절대 임계값을
+    쓰려면 "0.55%가 몇 점인가"를 정해야 하는데 그 값이 SSOT에 없다(A-1의
+    「변수별 기준 범위」표에 상환유연성 행이 없다).
+
+    비교 대상은 중도상환 **수수료율**뿐이다. 면제 조건은 차주의 향후 상환 방식이나
+    자유텍스트 자격에 달려 있어 판정하지 않는다(부록 B-3). 그 조건은 검수표가
+    `notes`로 실어 사용자가 직접 확인하게 한다.
+
+    하나라도 확정하지 못하면 **아무에게도 점수를 주지 않는다.** 일부만 점수를
+    받으면 확정된 상품끼리만 비교된 값이 전체 순위에 섞여, 확정하지 못한 상품이
+    부당하게 불리해진다. 총비용 점수가 같은 이유로 전부-또는-전무다.
+    """
+    resolved = {
+        name: resolve_prepayment_terms(name, request.user_facts)
+        for name in dict.fromkeys(product_names)
+    }
+    rates = {
+        name: item.fee_rate for name, item in resolved.items() if item.fee_rate is not None
+    }
+    if not rates or len(rates) != len(resolved):
+        return {}
+
+    lowest = min(rates.values())
+    highest = max(rates.values())
+    if highest == lowest:
+        # 모두 같으면 우열이 없다. 0점으로 만들면 없는 차이를 만들어낸다.
+        return dict.fromkeys(rates, Decimal(1))
+    # 수수료율이 낮을수록 유연하다 → 역방향 정규화.
+    return {
+        name: (highest - rate) / (highest - lowest) for name, rate in rates.items()
+    }
+
+
 def build_combination_legs(
     request: LoanSimulationRequest,
     result: LoanSimulationResult,
@@ -194,10 +235,14 @@ def build_combination_legs(
     legs: list[LoanLegCandidate] = []
     skipped: list[str] = []
     lookup = supplements or {}
+    computations = (*result.executable, *extra_computations)
+    # 상환유연성은 후보 집합 안에서 상대 정규화하므로 다리를 만들기 전에 한 번
+    # 계산한다. 다리마다 따로 구하면 비교 기준이 달라진다.
+    flexibility = _flexibility_scores(
+        request, [item.product_name for item in computations]
+    )
 
-    for index, computation in enumerate(
-        (*result.executable, *extra_computations), start=1
-    ):
+    for index, computation in enumerate(computations, start=1):
         name = computation.product_name
         group = collateral_group(name)
         if group is None:
@@ -255,8 +300,14 @@ def build_combination_legs(
                 additional_financial_cost=(
                     None if supplement is None else supplement.additional_financial_cost
                 ),
+                # 보조자료가 명시한 값이 우선이고, 없으면 검수된 중도상환
+                # 조건표에서 온 상대 점수를 쓴다. 둘 다 없으면 결측으로 남아
+                # 부록 A-10이 가중치를 재정규화한다.
                 repayment_flexibility_score=(
-                    None if supplement is None else supplement.repayment_flexibility_score
+                    supplement.repayment_flexibility_score
+                    if supplement is not None
+                    and supplement.repayment_flexibility_score is not None
+                    else flexibility.get(name)
                 ),
                 rate_type_name=(
                     None if computation.option is None else computation.option.rate_type_name

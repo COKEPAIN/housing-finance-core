@@ -159,12 +159,65 @@ class TestLegMapping:
         assert legs[0].additional_financial_cost == Decimal("500000")
         assert legs[0].repayment_flexibility_score == Decimal("0.8")
 
-    def test_a_missing_supplement_leaves_the_scores_unknown(self) -> None:
-        """0으로 채우면 총비용 0원·유연성 0점이라는 거짓이 된다."""
+    def test_a_missing_supplement_leaves_the_cost_unknown(self) -> None:
+        """0으로 채우면 총비용 0원이라는 거짓이 된다.
+
+        부대비용은 원문이 국민주택채권 할인비용처럼 실행 시점 시세에 달린 항목을
+        포함해 검수표로 확정할 수 없다. 확인될 때까지 결측으로 남는다.
+        """
         legs, _ = build_combination_legs(_request(), _result(_computation()))
 
         assert legs[0].additional_financial_cost is None
-        assert legs[0].repayment_flexibility_score is None
+
+    def test_flexibility_comes_from_the_reviewed_prepayment_table(self) -> None:
+        """상환유연성은 보조자료가 없어도 검수된 중도상환 조건표에서 온다.
+
+        원문이 "수수료율 + 부과기간 + 면제조건" 꼴로 규칙적이라 사람이 표로 옮길
+        수 있었다. 점수는 후보 집합 안에서 상대 정규화한다(부록 A-1).
+        """
+        legs, _ = build_combination_legs(
+            _request(),
+            _result(
+                _computation(KB_MORTGAGE),
+                _computation(KB_CREDIT, dsr_annual_rate=Decimal("0.045")),
+            ),
+        )
+
+        by_name = {leg.product_name: leg for leg in legs}
+        assert by_name[KB_MORTGAGE].repayment_flexibility_score is not None
+        assert by_name[KB_CREDIT].repayment_flexibility_score is not None
+        # 신용대출 0.11%가 주담대 0.55%보다 유연하다.
+        assert (
+            by_name[KB_CREDIT].repayment_flexibility_score
+            > by_name[KB_MORTGAGE].repayment_flexibility_score
+        )
+
+    def test_an_explicit_supplement_still_wins(self) -> None:
+        """호출자가 명시한 값이 검수표보다 우선한다."""
+        legs, _ = build_combination_legs(
+            _request(),
+            _result(_computation()),
+            supplements={
+                KB_MORTGAGE: LoanRecommendationSupplement(
+                    repayment_flexibility_score=Decimal("0.25")
+                )
+            },
+        )
+
+        assert legs[0].repayment_flexibility_score == Decimal("0.25")
+
+    def test_an_unreviewed_product_blocks_every_flexibility_score(self) -> None:
+        """하나라도 확정하지 못하면 아무에게도 점수를 주지 않는다.
+
+        일부만 점수를 받으면 확정된 상품끼리만 비교된 값이 전체 순위에 섞여,
+        확정하지 못한 상품이 부당하게 불리해진다.
+        """
+        legs, _ = build_combination_legs(
+            _request(),
+            _result(_computation(KB_MORTGAGE), _computation("검수표에 없는 대출")),
+        )
+
+        assert all(leg.repayment_flexibility_score is None for leg in legs)
 
 
 class TestNothingIsGuessed:
