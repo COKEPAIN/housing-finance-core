@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends
 
+from app.api.dependencies import DbConnection, load_loan_candidates
 from app.rule_engine.product_packs.handoff import ProductCandidate
 from app.rule_engine.product_packs.registry import ProductRulePackRegistry
 from app.schemas.simulation import SimulationInput, SimulationResult
@@ -22,15 +23,28 @@ from app.services.simulation_orchestrator import run_simulation
 router = APIRouter()
 
 
-def get_loan_candidates() -> Sequence[ProductCandidate]:
-    """계산에 넣을 대출 상품 후보.
+def get_calculated_at() -> datetime:
+    """계산 시각. 테스트가 고정할 수 있도록 의존성으로 분리한다."""
+    return datetime.now(tz=UTC)
 
-    아직 FastAPI에 DB 세션 배선이 없어 기본값은 빈 목록이다. 빈 목록이면
-    오케스트레이터가 대출 구간을 ``NOT_RUN``으로 두고 ``loan_product_candidates``를
-    결측으로 남긴다 — 후보를 못 불러온 상태를 "조건을 만족하는 상품이 없음"으로
-    위장하지 않는다. 상품 저장소를 붙일 때 이 의존성만 교체하면 된다.
+
+def get_loan_candidates(
+    connection: DbConnection,
+    calculated_at: Annotated[datetime, Depends(get_calculated_at)],
+) -> Sequence[ProductCandidate]:
+    """계산에 넣을 대출 상품 후보를 상품 DB에서 읽는다.
+
+    유효기간 필터는 리포지토리가 SQL 단계에서 적용한다(DESIGN §20 "계산일에 유효한
+    정책만 사용"). 그래서 계산 시각을 그대로 넘긴다 — 여기서 오늘 날짜를 다시
+    만들면 테스트가 고정한 시각과 어긋난다.
+
+    DB에 닿지 못하면 빈 목록이 아니라 503이다. 빈 목록은 상위 계층에서 결측으로
+    처리되는데, 조회 실패를 그 상태로 뭉개면 장애가 정상적인 결측처럼 보인다.
+
+    **상품 DB는 SSH 터널 너머에 있다.** 서버를 띄우기 전에 터널이 올라와 있어야
+    한다(`app/db/session.py` 참조).
     """
-    return ()
+    return load_loan_candidates(connection, as_of=calculated_at.date())
 
 
 def get_loan_rule_registry() -> ProductRulePackRegistry | None:
@@ -40,11 +54,6 @@ def get_loan_rule_registry() -> ProductRulePackRegistry | None:
     협력자이므로 의존성으로 노출해 테스트가 교체할 수 있게 한다.
     """
     return None
-
-
-def get_calculated_at() -> datetime:
-    """계산 시각. 테스트가 고정할 수 있도록 의존성으로 분리한다."""
-    return datetime.now(tz=UTC)
 
 
 def get_simulation_id() -> UUID:

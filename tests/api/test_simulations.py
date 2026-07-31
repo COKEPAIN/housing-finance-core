@@ -142,9 +142,15 @@ def _payload(**loan_overrides: object) -> dict[str, object]:
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
-    """계산 시각과 식별자를 고정한 클라이언트. 상품 후보는 기본 없음이다."""
+    """계산 시각과 식별자를 고정한 클라이언트. 상품 후보는 기본 없음이다.
+
+    후보를 **명시적으로** 비운다. 예전에는 의존성 기본값이 빈 목록이라 이 줄이
+    없어도 됐지만, 이제 기본값이 상품 DB 조회다. 명시하지 않으면 테스트가 SSH
+    터널 너머 DB에 붙으려 한다.
+    """
     app.dependency_overrides[get_calculated_at] = lambda: _CALCULATED_AT
     app.dependency_overrides[get_simulation_id] = lambda: UUID(_SIMULATION_ID)
+    app.dependency_overrides[get_loan_candidates] = lambda: []
     yield TestClient(app)
     app.dependency_overrides.clear()
 

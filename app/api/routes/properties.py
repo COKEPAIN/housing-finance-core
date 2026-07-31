@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.api.dependencies import DbConnection, load_loan_candidates
 from app.core.config import settings
 from app.repositories import JsonPropertyListingRepository, PropertyDatasetLoadError
 from app.rule_engine.product_packs.handoff import ProductCandidate as LoanProductCandidate
@@ -38,12 +39,6 @@ def get_property_repository() -> JsonPropertyListingRepository:
     return JsonPropertyListingRepository(_property_dataset_path())
 
 
-def get_property_loan_candidates() -> Sequence[LoanProductCandidate]:
-    """Return no candidates until the product-data dependency is connected."""
-
-    return ()
-
-
 def get_property_loan_rule_registry() -> ProductRulePackRegistry | None:
     return None
 
@@ -52,6 +47,23 @@ def get_property_calculated_at() -> datetime:
     """Use the Korean policy date around the UTC/KST day boundary."""
 
     return datetime.now(tz=SEOUL)
+
+
+def get_property_loan_candidates(
+    connection: DbConnection,
+    calculated_at: Annotated[datetime, Depends(get_property_calculated_at)],
+) -> Sequence[LoanProductCandidate]:
+    """Load loan products from the product database for this calculation date.
+
+    `/simulations`와 **같은 조회 함수**를 쓴다. 경로마다 따로 읽으면 유효기간
+    필터나 오류 처리가 갈라져 같은 상품이 다르게 보인다.
+
+    후보를 못 읽으면 빈 목록이 아니라 503이다. 빈 목록이면 매물이 `UNKNOWN`으로
+    떨어지는데, 그건 "판단할 정보가 없다"라서 조회 실패와 겹쳐 장애가 정상 상태처럼
+    보인다.
+    """
+
+    return load_loan_candidates(connection, as_of=calculated_at.date())
 
 
 @router.post("/search", response_model=PropertySearchResult)
